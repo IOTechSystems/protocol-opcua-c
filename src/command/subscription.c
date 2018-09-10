@@ -159,7 +159,7 @@ static edgeMapNode *removeSubFromMap(edgeMap *list, const char *valueAlias)
 
 void sendPublishRequest(UA_Client *client)
 {
-    UA_Client_Subscriptions_manuallySendPublishRequest(client);
+    UA_Client_runAsync(client, 1000);
 }
 
 static void monitoredItemHandler(UA_Client *client, UA_UInt32 monId, UA_DataValue *value, void *context)
@@ -462,28 +462,33 @@ static UA_StatusCode createSub(UA_Client *client, const EdgeMessage *msg)
         }
     }
 
-    UA_UInt32 subId = 0;
-    UA_SubscriptionSettings settings =
-    { subReq->publishingInterval, /* .requestedPublishingInterval */
-    subReq->lifetimeCount, /* .requestedLifetimeCount */
-    subReq->maxKeepAliveCount, /* .requestedMaxKeepAliveCount */
-    subReq->maxNotificationsPerPublish, /* .maxNotificationsPerPublish */
-    subReq->publishingEnabled, /* .publishingEnabled */
-    subReq->priority /* .priority */
+    //UA_UInt32 subId = 0;
+    UA_RequestHeader requestHeader;
+    UA_RequestHeader_init(&requestHeader);
+    UA_CreateSubscriptionRequest settings =
+    { 
+        requestHeader,
+        subReq->publishingInterval, /* .requestedPublishingInterval */
+        subReq->lifetimeCount, /* .requestedLifetimeCount */
+        subReq->maxKeepAliveCount, /* .requestedMaxKeepAliveCount */
+        subReq->maxNotificationsPerPublish, /* .maxNotificationsPerPublish */
+        subReq->publishingEnabled, /* .publishingEnabled */
+        subReq->priority /* .priority */
     };
 
+    
     /* Create a subscription */
-    UA_StatusCode retSub = UA_Client_Subscriptions_new(client, settings, &subId);
-    if (!subId)
+    UA_CreateSubscriptionResponse respSub = UA_Client_Subscriptions_create(client, settings, NULL, NULL, NULL);
+    if (!respSub.subscriptionId)
     {
-        // TODO: Handle Error
-        EDGE_LOG_V(TAG, "Error in creating subscription :: %s\n\n", UA_StatusCode_name(retSub));
-        return retSub;
+        // TODO: Handle Error 
+        EDGE_LOG_V(TAG, "Error in creating subscription :: %s\n\n", UA_StatusCode_name(respSub.responseHeader.serviceResult));
+        return respSub.responseHeader.serviceResult;
     }
 
-    EDGE_LOG_V(TAG, "Subscription ID received is %u\n", subId);
+    EDGE_LOG_V(TAG, "Subscription ID received is %u\n", respSub.subscriptionId);
 
-    if (NULL != clientSub && hasSubscriptionId(clientSub->subscriptionList, subId))
+    if (NULL != clientSub && hasSubscriptionId(clientSub->subscriptionList, respSub.subscriptionId))
     {
         EDGE_LOG_V(TAG, "ERROR :: Subscription ID is already present in subscriptionList %s\n",
                 UA_StatusCode_name(UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID));
@@ -496,12 +501,6 @@ static UA_StatusCode createSub(UA_Client *client, const EdgeMessage *msg)
     if(IS_NULL(items))
     {
         EDGE_LOG(TAG, "Error : Malloc failed for items in create subscription");
-        goto EXIT;
-    }
-    UA_UInt32 *monId = (UA_UInt32 *) EdgeMalloc(sizeof(UA_UInt32) * itemSize);
-    if(IS_NULL(monId))
-    {
-        EDGE_LOG(TAG, "Error : Malloc failed for monId in create subscription");
         goto EXIT;
     }
     UA_StatusCode *itemResults = (UA_StatusCode *) EdgeMalloc(sizeof(UA_StatusCode) * itemSize);
@@ -524,9 +523,17 @@ static UA_StatusCode createSub(UA_Client *client, const EdgeMessage *msg)
         goto EXIT;
     }
 
+    UA_RequestHeader monReqHeader;
+    UA_RequestHeader_init(&monReqHeader);
+    UA_CreateMonitoredItemsRequest monItemReq;
+    monItemReq.requestHeader=monReqHeader;
+    monItemReq.subscriptionId=respSub.subscriptionId;
+    monItemReq.timestampsToReturn=UA_TIMESTAMPSTORETURN_BOTH; //TODO: Work out how this option should be seeded.
+    monItemReq.itemsToCreateSize=itemSize;
+    monItemReq.itemsToCreate=items;
+    
     for (int i = 0; i < itemSize; i++)
     {
-        monId[i] = 0;
         hfs[i] = &monitoredItemHandler;
         client_alias[i] = (client_valueAlias*) EdgeMalloc(sizeof(client_valueAlias));
          if(IS_NULL(client_alias[i]))
@@ -555,43 +562,46 @@ static UA_StatusCode createSub(UA_Client *client, const EdgeMessage *msg)
         items[i].requestedParameters.samplingInterval =
                 msg->requests[i]->subMsg->samplingInterval;
         items[i].requestedParameters.discardOldest = true;
-        items[i].requestedParameters.queueSize = 1;
+        items[i].requestedParameters.queueSize = 1;    
     }
 
-    UA_StatusCode retMon = UA_Client_Subscriptions_addMonitoredItems(client, subId, items, itemSize,
-            hfs, (void **) client_alias, itemResults, monId);
-    (void) retMon;
+    //UA_StatusCode retMon = UA_Client_Subscriptions_addMonitoredItems(client, subId, items, itemSize,
+    //        hfs, (void **) client_alias, itemResults, monId);
+    
+    UA_CreateMonitoredItemsResponse monResponse = UA_Client_MonitoredItems_createDataChanges(client,monItemReq,(void **) client_alias,(void *)hfs,NULL);
+    
+    
     for (int i = 0; i < itemSize; i++)
     {
         EDGE_LOG_V(TAG, "Monitoring Details for item : %d\n", i);
-        if (monId[i])
+        if (monResponse.results[i].monitoredItemId)
         {
-            if (clientSub != NULL && !validateMonitoringId(clientSub->subscriptionList, subId, monId[i]))
+            if (clientSub != NULL && !validateMonitoringId(clientSub->subscriptionList, respSub.subscriptionId, monResponse.results[i].monitoredItemId))
             {
-                EDGE_LOG_V(TAG, "Error :: Existing Monitored ID received:: %u\n", monId[i]);
+                EDGE_LOG_V(TAG, "Error :: Existing Monitored ID received:: %u\n", monResponse.results[i].monitoredItemId);
                 EDGE_LOG_V(TAG, "Existing Node Details : Sub ID %d, Monitored ID :: %u\n"
 
-                    "Error :: %s Not added to subscription list\n\n ", subId, monId[i], client_alias[i]->valueAlias);
+                    "Error :: %s Not added to subscription list\n\n ", respSub.subscriptionId, monResponse.results[i].monitoredItemId, client_alias[i]->valueAlias);
                 continue;
             }
 
-            EDGE_LOG_V(TAG, "\tMonitoring ID :: %u\n", monId[i]);
+            EDGE_LOG_V(TAG, "\tMonitoring ID :: %u\n", monResponse.results[i].monitoredItemId);
         }
         else
         {
             // TODO: Handle Error
-            EDGE_LOG_V(TAG, "ERROR : INVALID Monitoring ID Recevived for item :: #%d,  Error : %d\n", i, retMon);
+            EDGE_LOG_V(TAG, "ERROR : INVALID Monitoring ID Recevived for item :: #%d,  Error : %d\n", i, monResponse.results[i].monitoredItemId);
             return UA_STATUSCODE_BADMONITOREDITEMIDINVALID;
         }
 
-        if (itemResults[i] == UA_STATUSCODE_GOOD)
+        if (monResponse.results[i].statusCode == UA_STATUSCODE_GOOD)
         {
-            EDGE_LOG_V(TAG, "\tMonitoring Result ::  %s\n", UA_StatusCode_name(itemResults[i]));
+            EDGE_LOG_V(TAG, "\tMonitoring Result ::  %s\n", UA_StatusCode_name(monResponse.results[i].statusCode));
         }
         else
         {
-            EDGE_LOG_V(TAG, "ERROR Result Recevied for this item : %s\n", UA_StatusCode_name(itemResults[i]));
-            return itemResults[i];
+            EDGE_LOG_V(TAG, "ERROR Result Recevied for this item : %s\n", UA_StatusCode_name(monResponse.results[i].statusCode));
+            return monResponse.results[i].statusCode;
         }
 
         if (IS_NULL(clientSub))
@@ -628,8 +638,8 @@ static UA_StatusCode createSub(UA_Client *client, const EdgeMessage *msg)
             }
             //memcpy(msgCopy, msg, sizeof * msg);
             subInfo->msg = msgCopy;
-            subInfo->subId = subId;
-            subInfo->monId = monId[i];
+            subInfo->subId = respSub.subscriptionId;
+            subInfo->monId = monResponse.results[i].monitoredItemId;
             subInfo->hfContext = client_alias[i];
             EDGE_LOG_V(TAG, "Inserting MAP ELEMENT valueAlias :: %s \n",
                    msgCopy->requests[i]->nodeInfo->valueAlias);
@@ -662,7 +672,6 @@ static UA_StatusCode createSub(UA_Client *client, const EdgeMessage *msg)
     clientSub->subscriptionCount++;
 
     EXIT:
-    EdgeFree(monId);
     EdgeFree(hfs);
     EdgeFree(itemResults);
     EdgeFree(items);
@@ -685,13 +694,23 @@ static UA_StatusCode deleteSub(UA_Client *client, const EdgeMessage *msg)
     EDGE_LOG_V(TAG, "SUB ID :: %d\n", subInfo->subId);
     EDGE_LOG_V(TAG, "MON ID :: %d\n", subInfo->monId);
 
-    UA_StatusCode ret = UA_Client_Subscriptions_removeMonitoredItem(client, subInfo->subId,
-            subInfo->monId);
+    UA_RequestHeader monReqHeader;
+    UA_RequestHeader_init(&monReqHeader);
+    UA_DeleteMonitoredItemsRequest monDelReq;
+    monDelReq.requestHeader=monReqHeader;
+    monDelReq.subscriptionId=subInfo->subId;
+    monDelReq.monitoredItemIdsSize=1; //TODO: Why do we only delete one monitored item when trying to delete a subscription?
+    UA_UInt32 monIDarr[subInfo->monId];
+    monDelReq.monitoredItemIds=monIDarr;
+    UA_DeleteMonitoredItemsResponse monItemDelResp = UA_Client_MonitoredItems_delete(client,monDelReq);
+    
+    //UA_StatusCode ret = UA_Client_Subscriptions_removeMonitoredItem(client, subInfo->subId,
+    //        subInfo->monId);
 
-    if (UA_STATUSCODE_GOOD != ret)
+    if (UA_STATUSCODE_GOOD != monItemDelResp.results[0])// See 699
     {
         EDGE_LOG_V(TAG, "Error in removing monitored item : MON ID %d \n", subInfo->monId);
-        return ret;
+        return monItemDelResp.results[0];// See 699
     }
     else
     {
@@ -717,11 +736,22 @@ static UA_StatusCode deleteSub(UA_Client *client, const EdgeMessage *msg)
     if (!hasSubscriptionId(clientSub->subscriptionList, subInfo->subId))
     {
         EDGE_LOG_V(TAG, "Removing the subscription  SID %d \n", subInfo->subId);
-        UA_StatusCode retVal = UA_Client_Subscriptions_remove(client, subInfo->subId);
-        if (UA_STATUSCODE_GOOD != retVal)
+        
+        UA_RequestHeader subDelReqHeader;
+        UA_RequestHeader_init(&subDelReqHeader);
+        UA_DeleteSubscriptionsRequest subDelReq;
+        subDelReq.requestHeader = subDelReqHeader;
+        subDelReq.subscriptionIdsSize=1;//TODO: How to factor this in?
+        UA_UInt32 subIDarr[subInfo->subId];
+        subDelReq.subscriptionIds=subIDarr;
+        
+        UA_DeleteSubscriptionsResponse subDelResp = UA_Client_Subscriptions_delete(client,subDelReq);
+        
+        //UA_StatusCode retVal = UA_Client_Subscriptions_remove(client, subInfo->subId);
+        if (UA_STATUSCODE_GOOD != subDelResp.results[0])
         {
             EDGE_LOG_V(TAG, "Error in removing subscription  SID %d \n", subInfo->subId);
-            return retVal;
+            return subDelResp.results[0];
         }
         clientSub->subscriptionCount--;
         if (0 == clientSub->subscriptionCount)
@@ -761,7 +791,8 @@ static UA_StatusCode modifySub(UA_Client *client, const EdgeMessage *msg)
     modifySubscriptionRequest.requestedMaxKeepAliveCount = subReq->maxKeepAliveCount;
     modifySubscriptionRequest.requestedPublishingInterval = subReq->publishingInterval;
 
-    UA_ModifySubscriptionResponse response = UA_Client_Service_modifySubscription(client,
+
+    UA_ModifySubscriptionResponse response = UA_Client_Subscriptions_modify(client,
             modifySubscriptionRequest);
     if (response.responseHeader.serviceResult != UA_STATUSCODE_GOOD)
     {
