@@ -89,7 +89,7 @@ static void *server_sample_loop(void *ptr)
 {
     char s_value[MAX_ENDPOINT_URI_SIZE] =
     { };
-    char dataNum[1];
+    char dataNum[10];
 
     while (b_running)
     {
